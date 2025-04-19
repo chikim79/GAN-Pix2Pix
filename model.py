@@ -27,10 +27,9 @@ def prepare_data_from_dataframe(color_df, gray_df):
     Args:
         color_df: DataFrame with color images
         gray_df: DataFrame with grayscale images
-        max_images: Maximum number of images to use (for testing)
 
     Returns:
-        Arrays of color and grayscale images
+        Arrays of color and grayscale images, plus list of filenames
     """
     # Make sure the DataFrames are matched by filename
     color_df = color_df.set_index('fileName')
@@ -42,18 +41,16 @@ def prepare_data_from_dataframe(color_df, gray_df):
     # Create empty lists to store preprocessed images
     color_img = []
     gray_img = []
+    filenames = []  # Track filenames
 
     # Process each image pair
     print("Processing images...")
     for filename in common_files:
         # Get color image and normalize
         color_image = color_df.loc[filename, 'color']
-        # color_image = color_image.astype('float32') / 255.0
 
         # Get grayscale image and normalize
-        # Using 'color' column which has RGB format
         gray_image = gray_df.loc[filename, 'color']
-        # gray_image = gray_image.astype('float32') / 255.0
 
         color_image = cv2.resize(color_image, (IMAGE_SIZE, IMAGE_SIZE))
         gray_image = cv2.resize(gray_image, (IMAGE_SIZE, IMAGE_SIZE))
@@ -63,8 +60,9 @@ def prepare_data_from_dataframe(color_df, gray_df):
 
         color_img.append(color_image)
         gray_img.append(gray_image)
+        filenames.append(filename)  # Store the filename
 
-    return np.array(color_img), np.array(gray_img)
+    return np.array(color_img), np.array(gray_img), filenames
 
 
 color_images, gray_images = prepare_data_from_dataframe(
@@ -75,7 +73,7 @@ LAMBDA = 100
 EPOCHS = 30
 
 
-def preprocess_data(color_images, gray_images, train_split=0.8):
+def preprocess_data(color_images, gray_images, filenames, train_split=0.8):
     """Split data into training and validation sets"""
     # Determine split index
     num_samples = len(color_images)
@@ -84,14 +82,15 @@ def preprocess_data(color_images, gray_images, train_split=0.8):
     # Create training datasets
     train_color = color_images[:split_idx]
     train_gray = gray_images[:split_idx]
+    train_filenames = filenames[:split_idx]
 
     # Create validation datasets
     val_color = color_images[split_idx:]
     val_gray = gray_images[split_idx:]
+    val_filenames = filenames[split_idx:]
 
-    # Create TensorFlow datasets
-    train_dataset = tf.data.Dataset.from_tensor_slices(
-        (train_gray, train_color))
+    # Create TensorFlow datasets for images
+    train_dataset = tf.data.Dataset.from_tensor_slices((train_gray, train_color))
     train_dataset = train_dataset.batch(BATCH_SIZE)
     train_dataset = train_dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
 
@@ -99,10 +98,14 @@ def preprocess_data(color_images, gray_images, train_split=0.8):
     val_dataset = val_dataset.batch(BATCH_SIZE)
     val_dataset = val_dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
 
-    return train_dataset, val_dataset
+    # Create TensorFlow datasets for filenames
+    train_filenames_dataset = tf.data.Dataset.from_tensor_slices(train_filenames)
+    train_filenames_dataset = train_filenames_dataset.batch(BATCH_SIZE)
 
+    val_filenames_dataset = tf.data.Dataset.from_tensor_slices(val_filenames)
+    val_filenames_dataset = val_filenames_dataset.batch(BATCH_SIZE)
 
-train_dataset, val_dataset = preprocess_data(color_images, gray_images)
+    return train_dataset, val_dataset, train_filenames_dataset, val_filenames_dataset
 
 
 # Model building functions
@@ -297,11 +300,24 @@ def train_step(input_images, target_images, generator, discriminator,
     return gen_total_loss, gen_gan_loss, gen_l1_loss, disc_loss
 
 
-def generate_and_save_images(model, test_input, target, filename=None):
-    """Generate colorized images and save if filename is provided"""
+def generate_and_save_images(model, test_input, target, filename=None, sample_name=None):
+    """Generate colorized images and save if filename is provided
+    
+    Args:
+        model: The generator model
+        test_input: Input grayscale image
+        target: Target color image
+        filename: Optional filename to save the figure
+        sample_name: Original filename or identifier to display in the title
+    """
     prediction = model(test_input, training=False)
 
-    plt.figure(figsize=(15, 3))
+    # Adjusted figure size to better fit 128x128 images
+    plt.figure(figsize=(8, 2))
+    
+    # Add the sample name to the figure title if provided
+    title_text = f"Image Colorization: {sample_name}" if sample_name else "Image Colorization Results"
+    plt.suptitle(title_text, fontsize=14)
 
     display_list = [test_input[0], target[0], prediction[0]]
     title = ['Input (Grayscale)', 'Ground Truth (Color)', 'Predicted (Color)']
@@ -310,10 +326,11 @@ def generate_and_save_images(model, test_input, target, filename=None):
         plt.subplot(1, 3, i+1)
         plt.title(title[i])
 
-        plt.imshow(display_list[i] * 0.5 + 0.5)  # Rescale to [0, 1]
+        # Rescale to [0, 1] for display
+        plt.imshow(display_list[i] * 0.5 + 0.5)
         plt.axis('off')
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for suptitle
 
     if filename:
         plt.savefig(filename)
@@ -322,29 +339,54 @@ def generate_and_save_images(model, test_input, target, filename=None):
         plt.show()
 
 
-def display_sample_results(model, dataset, num_samples=3):
-    """Display sample results during training"""
+def display_sample_results(model, dataset, filenames_dataset=None, num_samples=4):
+    """Display sample results during training
+    
+    Args:
+        model: The generator model
+        dataset: Dataset containing input and target images
+        filenames_dataset: Optional dataset containing filenames corresponding to the images
+        num_samples: Number of samples to display
+    """
+    # Only take one batch
+    if filenames_dataset is not None:
+        # Get the filenames batch
+        filenames_batch = next(iter(filenames_dataset.take(1)))
+    else:
+        filenames_batch = None
+        
+    # Get the image batch
     for input_image, target_image in dataset.take(1):
-        for i in range(min(num_samples, input_image.shape[0])):
+        # Ensure we don't try to display more samples than are in the batch
+        samples_to_display = min(num_samples, input_image.shape[0])
+        
+        for i in range(samples_to_display):
+            # Get the filename if available, otherwise use sample number
+            if filenames_batch is not None and i < len(filenames_batch):
+                filename = filenames_batch[i].numpy().decode('utf-8')
+            else:
+                filename = f"Sample {i+1}"
+                
             generate_and_save_images(
                 model,
                 input_image[i:i+1],
-                target_image[i:i+1])
+                target_image[i:i+1],
+                sample_name=filename
+            )
 
 
-def train_model(train_dataset, val_dataset, epochs):
+def train_model(train_dataset, val_dataset, train_filenames_dataset, val_filenames_dataset, epochs):
     """Train the pix2pix model"""
     print("Starting training...")
     # Build models
     generator = build_generator()
-    # Print summary of the generator model
     print(generator.summary())
     discriminator = build_discriminator()
     print(discriminator.summary())
 
     # Define optimizers
     generator_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5)
-    discriminator_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5)
+    discriminator_optimizer = tf.keras.optimizers.Adam(5e-6, beta_1=0.3)
 
     # Create checkpoints
     checkpoint_dir = './checkpoints'
@@ -431,7 +473,8 @@ def train_model(train_dataset, val_dataset, epochs):
 
         # Generate and display sample images
         if (epoch + 1) % 2 == 0:
-            display_sample_results(generator, val_dataset, num_samples=6)
+            # Now pass the filenames dataset to the display function
+            display_sample_results(generator, val_dataset, val_filenames_dataset, num_samples=4)
 
     # Final save
     checkpoint.save(file_prefix=checkpoint_prefix)
